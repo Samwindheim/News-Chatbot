@@ -1,60 +1,34 @@
 """
 News Scraper: A system for extracting structured data from The Guardian website
 
-This program scrapes content from The Guardian, processes it using LLM extraction,
+This program scrapes content from The Guardian, processes it using BeautifulSoup,
 and stores the results in a Chroma vector database for later retrieval.
 It handles the entire pipeline from web content fetching to structured data storage.
 
 Key Features:
 - Asynchronous web scraping with AsyncChromiumLoader
-- LLM-powered extraction of article metadata
+- Direct HTML parsing with BeautifulSoup
 - Vector embedding and storage in Chroma DB
 - Modular design with clear separation of concerns
 """
 
 from langchain_community.document_loaders import AsyncChromiumLoader
 from langchain_community.document_transformers import BeautifulSoupTransformer
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.chains import create_extraction_chain
+from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_community.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from bs4 import BeautifulSoup
 from typing import List, Dict, Optional
 import logging
 import os
 import asyncio
 import shutil
+import re
 from datetime import datetime
 
-# Define the schema for LLM extraction
-EXTRACTION_SCHEMA = {
-    "title": "NewsArticleExtraction",
-    "description": "Extract structured information from news articles",
-    "type": "object",
-    "properties": {
-        "news_article_title": {
-            "type": "string",
-            "description": "The title or headline of the news article"
-        },
-        "news_article_summary": {
-            "type": "string",
-            "description": "A brief summary or description of the article content"
-        },
-        "author": {
-            "type": "string",
-            "description": "The author of the article if available"
-        },
-        "publication_date": {
-            "type": "string",
-            "description": "The date when the article was published if available"
-        },
-        "category": {
-            "type": "string",
-            "description": "The category or section of the news article"
-        }
-    },
-    "required": ["news_article_title", "news_article_summary"]
-}
+# Set user agent for web requests
+os.environ["USER_AGENT"] = "Guardian News Scraper Bot (educational purposes)"
 
 # 1. Configuration and Setup
 def configure_logging():
@@ -87,70 +61,84 @@ async def fetch_content(urls, logger):
         logger.error(f"Error fetching content: {str(e)}")
         return []
 
-async def transform_content(html, logger):
-    """Transform HTML content using BeautifulSoupTransformer"""
-    try:
-        bs_transformer = BeautifulSoupTransformer()
-        docs_transformed = bs_transformer.transform_documents(
-            html,
-            tags_to_extract=["p", "h1", "h2", "h3", "article", "span", "a", "section"]
-        )
-        logger.info("Successfully transformed HTML content")
-        return docs_transformed
-    except Exception as e:
-        logger.error(f"Error transforming content: {str(e)}")
-        return []
-
 # 3. Content Processing and Extraction
-async def extract_content(documents, llm, logger):
-    """Use LLM to extract structured information from the transformed content"""
+def extract_articles_from_html(html_docs, logger):
+    """Extract article information directly from HTML using BeautifulSoup"""
     try:
-        extracted_content = []
+        articles = []
         
-        for doc in documents:
-            try:
-                # For GPT-4, use function calling approach
-                response = await asyncio.to_thread(
-                    lambda content: llm.invoke(
-                        f"Extract the news article information from the following text: {content}",
-                        functions=[{
-                            "name": "extract_news_article",
-                            "description": "Extract structured information from news articles",
-                            "parameters": EXTRACTION_SCHEMA
-                        }],
-                        function_call={"name": "extract_news_article"}
-                    ),
-                    doc.page_content
-                )
+        for html_doc in html_docs:
+            soup = BeautifulSoup(html_doc.page_content, 'html.parser')
+            
+            # The Guardian's article elements typically have specific classes
+            # Find all article elements
+            article_elements = soup.find_all('div', class_=lambda c: c and ('fc-item' in c or 'dcr-' in c or 'js-headline-text' in c))
+            
+            if not article_elements:
+                # Try alternative selectors
+                article_elements = soup.find_all(['article', 'div'], class_=lambda c: c and ('article' in c.lower() if c else False))
+            
+            # Process each article element
+            for article_element in article_elements:
+                # Extract title
+                title_element = article_element.find(['h1', 'h2', 'h3'], class_=lambda c: c and ('headline' in c.lower() if c else False))
+                if not title_element:
+                    title_element = article_element.find(['h1', 'h2', 'h3'])
                 
-                # Extract the function call arguments
-                if hasattr(response, 'additional_kwargs') and 'function_call' in response.additional_kwargs:
-                    import json
-                    function_args = json.loads(response.additional_kwargs['function_call']['arguments'])
-                    extracted_content.append(function_args)
-            except Exception as inner_e:
-                logger.warning(f"Error extracting content from document: {str(inner_e)}")
-                continue
+                title = title_element.get_text().strip() if title_element else None
+                
+                # Skip if no title found
+                if not title:
+                    continue
+                
+                # Extract summary
+                summary_element = article_element.find('div', class_=lambda c: c and ('standfirst' in c.lower() if c else False))
+                if not summary_element:
+                    # Try to find paragraphs
+                    p_elements = article_element.find_all('p')
+                    summary = ' '.join([p.get_text().strip() for p in p_elements[:2]]) if p_elements else ''
+                else:
+                    summary = summary_element.get_text().strip()
+                
+                # Extract date (if available)
+                date_element = article_element.find(['time', 'span'], attrs={'datetime': True})
+                date = date_element.get('datetime') if date_element else None
+                if not date:
+                    date_element = article_element.find(text=re.compile(r'\d{1,2}\s+[A-Za-z]{3}\s+\d{4}'))
+                    date = date_element if date_element else None
+                
+                # Extract author (if available)
+                author_element = article_element.find(['span', 'div', 'a'], class_=lambda c: c and ('contributor' in c.lower() or 'byline' in c.lower() if c else False))
+                author = author_element.get_text().strip() if author_element else None
+                
+                # Extract category
+                category_element = article_element.find(['a', 'span'], class_=lambda c: c and ('kicker' in c.lower() or 'section' in c.lower() if c else False))
+                category = category_element.get_text().strip() if category_element else None
+                
+                # Create article dict
+                article = {
+                    'news_article_title': title,
+                    'news_article_summary': summary if summary else "No summary available",
+                    'author': author if author else "Unknown",
+                    'publication_date': date if date else "Unknown",
+                    'category': category if category else "Uncategorized",
+                    'source_url': html_doc.metadata.get('source', '')
+                }
+                
+                articles.append(article)
         
-        logger.info(f"Successfully extracted {len(extracted_content)} articles")
-        return extracted_content
+        # Remove duplicates based on title
+        unique_articles = []
+        seen_titles = set()
+        for article in articles:
+            if article['news_article_title'] not in seen_titles:
+                seen_titles.add(article['news_article_title'])
+                unique_articles.append(article)
+        
+        logger.info(f"Successfully extracted {len(unique_articles)} unique articles")
+        return unique_articles
     except Exception as e:
-        logger.error(f"Error extracting content: {str(e)}")
-        return []
-
-def process_and_split_content(documents, logger):
-    """Process and split the transformed content into manageable chunks"""
-    try:
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-        )
-        split_docs = text_splitter.split_documents(documents)
-        logger.info(f"Split content into {len(split_docs)} chunks")
-        return split_docs
-    except Exception as e:
-        logger.error(f"Error processing content: {str(e)}")
+        logger.error(f"Error extracting articles: {str(e)}")
         return []
 
 # 4. Storage Functions
@@ -171,6 +159,7 @@ def create_documents_from_extractions(extracted_content, logger):
                     "date": item.get('publication_date', 'N/A'),
                     "category": item.get('category', 'N/A'),
                     "source": "The Guardian",
+                    "source_url": item.get('source_url', ''),
                     "scraped_at": datetime.now().isoformat()
                 }
             )
@@ -214,14 +203,12 @@ async def run_scraper(urls=None, reset_db=False, persist_directory="./chroma_db"
         urls = [
             "https://www.theguardian.com/us",
             "https://www.theguardian.com/us/technology",
-            "https://www.theguardian.com/world"
+            "https://www.theguardian.com/world",
+            "https://www.theguardian.com/business"
         ]
     
     # Configure logging
     logger = configure_logging()
-    
-    # Initialize LLM
-    llm = ChatOpenAI(temperature=0, model="gpt-4")
     
     # Reset vector store if requested
     if reset_db:
@@ -232,14 +219,12 @@ async def run_scraper(urls=None, reset_db=False, persist_directory="./chroma_db"
     if not html:
         return None
     
-    transformed_docs = await transform_content(html, logger)
-    if not transformed_docs:
-        return None
-    
-    extracted_content = await extract_content(transformed_docs, llm, logger)
+    # Extract articles from HTML
+    extracted_content = extract_articles_from_html(html, logger)
     if not extracted_content:
         return None
     
+    # Create document objects
     documents = create_documents_from_extractions(extracted_content, logger)
     if not documents:
         return None
